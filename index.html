@@ -224,6 +224,16 @@ tbody tr:hover{background:#fafbfe}
 .chip{display:inline-flex;align-items:center;gap:5px;padding:5px 10px;border-radius:9px;border:1px solid var(--line);background:#fff;font-size:12.5px;font-weight:600;cursor:pointer}
 .chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
 
+/* auth */
+#authMask{position:fixed;inset:0;z-index:80;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(242,244,249,.95);backdrop-filter:blur(8px)}
+#authMask.show{display:flex}
+.authCard{width:min(390px,100%);background:#fff;border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:0 24px 60px -30px rgba(15,23,42,.5)}
+.authCard h3{font-size:17px;margin:12px 0 4px}
+.authCard .field{margin-top:12px}
+.authCard .btn{width:100%;justify-content:center;margin-top:10px}
+#syncChip{font-size:11px;padding:3px 9px}
+@media(max-width:640px){#syncChip{display:none}}
+
 /* dialog */
 dialog{border:none;border-radius:18px;padding:0;width:min(460px,92vw);box-shadow:0 30px 70px -30px rgba(15,23,42,.6);background:#fff}
 dialog::backdrop{background:rgba(15,23,42,.35);backdrop-filter:blur(2px)}
@@ -264,6 +274,7 @@ dialog::backdrop{background:rgba(15,23,42,.35);backdrop-filter:blur(2px)}
     <div class="clockSub" id="clockSub">&nbsp;</div>
   </div>
   <div class="spacer"></div>
+  <span class="pill grey" id="syncChip">本地模式</span>
   <button class="btn" data-act="genToday">⚡ 生成今日任务</button>
   <button class="btn primary" data-act="newTask">＋ 新增任务</button>
 </header>
@@ -356,6 +367,20 @@ dialog::backdrop{background:rgba(15,23,42,.35);backdrop-filter:blur(2px)}
   </div>
 </dialog>
 
+<div id="authMask">
+  <div class="authCard">
+    <div class="logo">▶</div>
+    <h3 id="authTitle">登录工作台</h3>
+    <div class="hint">用邮箱登录，手机和电脑看到的是同一份数据。</div>
+    <div class="field"><label>邮箱</label><input id="authEmail" type="email" autocomplete="username" placeholder="you@company.com"></div>
+    <div class="field"><label>密码</label><input id="authPass" type="password" autocomplete="current-password" placeholder="注册时至少 6 位"></div>
+    <div class="hint" id="authErr" style="color:#dc2626;min-height:18px;margin-top:8px"></div>
+    <button class="btn primary" id="authLogin">登录</button>
+    <button class="btn" id="authSignup">没有账号？注册一个</button>
+    <div class="hint" style="margin-top:12px;text-align:center;font-size:11px">注册后直接进，不需要去邮箱点确认</div>
+  </div>
+</div>
+
 <div id="toast"></div>
 
 <script>
@@ -436,7 +461,133 @@ function load(){
     return Object.assign(seed(), s);
   }catch(e){ console.warn(e); return seed(); }
 }
-function save(){ try{ localStorage.setItem(KEY, JSON.stringify(state)); }catch(e){ console.warn(e); } }
+function saveLocal(){ try{ localStorage.setItem(KEY, JSON.stringify(state)); }catch(e){ console.warn(e); } }
+function save(){ saveLocal(); scheduleSync(); }
+
+/* ---------------- 云端账号与同步（Supabase） ---------------- */
+const CFG = { url: 'https://tqrdetbuferecxqhadli.supabase.co', key: 'sb_publishable_bj-iQkqabaG39cFDwC64rw_6VO64SYq', table: 'states' };
+const SK = 'vops.session.v1';
+let SESSION = null, syncTimer = null, syncing = false, booting = false;
+
+function hasCloud(){ return !!(CFG.url && CFG.key); }
+function setSync(t, cls){ const el=$('#syncChip'); if(!el) return; el.textContent=t; el.className='pill '+(cls||'grey'); }
+function loadSession(){ try{ return JSON.parse(localStorage.getItem(SK)||'null'); }catch(e){ return null; } }
+function saveSession(s){ try{ if(s) localStorage.setItem(SK, JSON.stringify(s)); else localStorage.removeItem(SK); }catch(e){} }
+function authErr(msg){ const e=$('#authErr'); if(e) e.textContent = msg||''; }
+
+async function sbFetch(path, opts){
+  opts = opts||{};
+  const headers = Object.assign({ 'apikey': CFG.key, 'Content-Type': 'application/json' }, opts.headers||{});
+  if(opts.auth !== false) headers['Authorization'] = 'Bearer ' + (opts.token || (SESSION && SESSION.access_token) || CFG.key);
+  const res = await fetch(CFG.url + path, { method: opts.method||'GET', headers, body: opts.body });
+  const txt = await res.text();
+  let data = null; try{ data = txt ? JSON.parse(txt) : null; }catch(e){ data = txt; }
+  if(!res.ok){
+    const msg = (data && (data.error_description || data.msg || data.message || data.hint)) || ('HTTP '+res.status);
+    throw new Error(msg);
+  }
+  return data;
+}
+
+async function ensureToken(){
+  if(!SESSION) throw new Error('未登录');
+  if(Date.now() < (SESSION.expires_at||0) - 60000) return SESSION.access_token;
+  const r = await sbFetch('/auth/v1/token?grant_type=refresh_token', {method:'POST', auth:false, token: CFG.key, body: JSON.stringify({refresh_token: SESSION.refresh_token})});
+  SESSION.access_token = r.access_token;
+  if(r.refresh_token) SESSION.refresh_token = r.refresh_token;
+  SESSION.expires_at = Date.now() + (r.expires_in||3600)*1000;
+  saveSession(SESSION);
+  return SESSION.access_token;
+}
+
+async function pullState(){
+  const tk = await ensureToken();
+  const rows = await sbFetch('/rest/v1/'+CFG.table+'?select=data&user_id=eq.'+SESSION.user.id, {token: tk});
+  return (Array.isArray(rows) && rows.length) ? rows[0].data : null;
+}
+
+async function pushState(){
+  const tk = await ensureToken();
+  await sbFetch('/rest/v1/'+CFG.table, {
+    method:'POST', token: tk,
+    headers: { 'Prefer': 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify({ user_id: SESSION.user.id, data: state, updated_at: new Date().toISOString() })
+  });
+}
+
+function scheduleSync(){
+  if(!hasCloud() || !SESSION || booting) return;
+  clearTimeout(syncTimer);
+  setSync('待同步','warn');
+  syncTimer = setTimeout(doSync, 1500);
+}
+
+async function doSync(){
+  if(!hasCloud() || !SESSION || syncing) return;
+  syncing = true; setSync('同步中','acc');
+  try{
+    await pushState();
+    setSync('已同步','ok');
+  }catch(e){
+    setSync('离线待同步','warn');
+    clearTimeout(syncTimer); syncTimer = setTimeout(doSync, 20000);
+  }finally{ syncing = false; }
+}
+
+async function doLogin(signup){
+  authErr('');
+  const email = ($('#authEmail').value||'').trim();
+  const pass = ($('#authPass').value||'');
+  if(!email || !pass){ authErr('请填写邮箱和密码'); return; }
+  if(pass.length < 6){ authErr('密码至少 6 位'); return; }
+  const b1 = $('#authLogin'), b2 = $('#authSignup');
+  b1.disabled = true; b2.disabled = true; b1.textContent = '处理中…';
+  try{
+    const path = signup ? '/auth/v1/signup' : '/auth/v1/token?grant_type=password';
+    const r = await sbFetch(path, {method:'POST', auth:false, token: CFG.key, body: JSON.stringify({email, password: pass})});
+    if(!r || !r.access_token){
+      authErr(signup ? '注册成功，但还要求邮箱验证。请让管理员在 Supabase 关掉邮箱验证后重试。' : '登录失败，请检查邮箱密码');
+      return;
+    }
+    SESSION = { access_token: r.access_token, refresh_token: r.refresh_token, expires_at: Date.now()+(r.expires_in||3600)*1000, user: r.user };
+    saveSession(SESSION);
+    await afterLogin();
+  }catch(e){
+    authErr(String(e.message||e));
+  }finally{
+    b1.disabled = false; b2.disabled = false; b1.textContent = '登录';
+  }
+}
+
+async function afterLogin(){
+  booting = true;
+  setSync('同步中','acc');
+  try{
+    const remote = await pullState();
+    if(remote){ state = Object.assign(seed(), remote); saveLocal(); render(); }
+    else { await pushState(); }
+    $('#authMask').classList.remove('show');
+    setSync('已同步','ok');
+  }catch(e){
+    setSync('连接失败','bad');
+    authErr('连不上云端：'+String(e.message||e));
+    $('#authMask').classList.add('show');
+    throw e;
+  }finally{ booting = false; }
+}
+
+function bootAuth(){
+  if(!hasCloud()){ setSync('本地模式','grey'); return; }
+  SESSION = loadSession();
+  if(SESSION && SESSION.user){ afterLogin().catch(function(){}); }
+  else { $('#authMask').classList.add('show'); }
+}
+
+function logout(){
+  SESSION = null; saveSession(null);
+  try{ localStorage.removeItem(KEY); }catch(e){}
+  location.reload();
+}
 
 /* ---------------- 周期逻辑 ---------------- */
 function weekStartOf(ds){
@@ -918,7 +1069,11 @@ function renderSettings(){
   </section>
 
   <section class="card">
-    <div class="chead"><h2>数据</h2><span class="sub">数据存在本机浏览器，清缓存会丢，记得备份</span></div>
+    <div class="chead"><h2>数据</h2><span class="sub">${hasCloud()?'数据自动同步到云端账号':'数据存在本机浏览器，清缓存会丢，记得备份'}</span></div>
+    ${hasCloud()?`<div class="srow"><div class="sl">云端账号</div><div class="sr">
+      <span class="hint">${SESSION?esc(SESSION.user.email||''):'未登录'}</span>
+      <button class="btn sm danger" data-act="logout">退出登录</button>
+      <span class="hint">手机和电脑用同一个账号登录，看到的是同一份数据</span></div></div>`:''}
     <div class="srow"><div class="sl">导出 Excel</div><div class="sr">
       <button class="btn" data-act="exportCsv">⬇ 导出 CSV（Excel 打开）</button>
       <span class="hint">按任务 / 周 / 月 / 报表分块的汇总表</span></div></div>
@@ -1052,6 +1207,7 @@ document.addEventListener('click', function(e){
       break;
     }
     case 'exportCsv': exportCsv(); break;
+    case 'logout': if(confirm('退出登录？本机缓存会清除，云端数据还在。')) logout(); break;
     case 'exportJson': exportJson(); break;
     case 'resetAll': {
       if(confirm('确定清空全部数据？此操作不可恢复。')){
@@ -1202,6 +1358,11 @@ document.addEventListener('change', function(e){
 function init(){
   state = load();
   render();
+  $('#authLogin').addEventListener('click', function(){ doLogin(false); });
+  $('#authSignup').addEventListener('click', function(){ doLogin(true); });
+  $('#authPass').addEventListener('keydown', function(e){ if(e.key === 'Enter') doLogin(false); });
+  $('#authEmail').addEventListener('keydown', function(e){ if(e.key === 'Enter') $('#authPass').focus(); });
+  bootAuth();
   $('#fSearch').addEventListener('input', renderTasks);
   $('#fAcc').addEventListener('change', renderTasks);
   $('#fStatus').addEventListener('change', renderTasks);
