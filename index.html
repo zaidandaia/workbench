@@ -225,8 +225,8 @@ tbody tr:hover{background:#fafbfe}
 .chip.on{background:var(--accent);border-color:var(--accent);color:#fff}
 
 /* auth */
-#authMask{position:fixed;inset:0;z-index:80;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(242,244,249,.95);backdrop-filter:blur(8px)}
-#authMask.show{display:flex}
+#authMask,#resetMask{position:fixed;inset:0;z-index:80;display:none;align-items:center;justify-content:center;padding:20px;background:rgba(242,244,249,.95);backdrop-filter:blur(8px)}
+#authMask.show,#resetMask.show{display:flex}
 .authCard{width:min(390px,100%);background:#fff;border:1px solid var(--line);border-radius:18px;padding:24px;box-shadow:0 24px 60px -30px rgba(15,23,42,.5)}
 .authCard h3{font-size:17px;margin:12px 0 4px}
 .authCard .field{margin-top:12px}
@@ -377,7 +377,19 @@ dialog::backdrop{background:rgba(15,23,42,.35);backdrop-filter:blur(2px)}
     <div class="hint" id="authErr" style="color:#dc2626;min-height:18px;margin-top:8px"></div>
     <button class="btn primary" id="authLogin">登录</button>
     <button class="btn" id="authSignup">没有账号？注册一个</button>
-    <div class="hint" style="margin-top:12px;text-align:center;font-size:11px">注册后直接进，不需要去邮箱点确认</div>
+    <div style="text-align:center;margin-top:10px"><a href="javascript:void(0)" id="authForgot" style="font-size:12.5px;color:#2563eb;text-decoration:none">忘记密码？</a></div>
+    <div class="hint" style="margin-top:10px;text-align:center;font-size:11px">注册后直接进，不需要去邮箱点确认</div>
+  </div>
+</div>
+
+<div id="resetMask">
+  <div class="authCard">
+    <div class="logo">▶</div>
+    <h3>设置新密码</h3>
+    <div class="hint">为你的账号设置一个新密码，保存后就能直接登录。</div>
+    <div class="field"><label>新密码</label><input id="resetPass" type="password" autocomplete="new-password" placeholder="至少 6 位"></div>
+    <div class="hint" id="resetErr" style="color:#dc2626;min-height:18px;margin-top:8px"></div>
+    <button class="btn primary" id="resetSave">保存</button>
   </div>
 </div>
 
@@ -474,6 +486,55 @@ function setSync(t, cls){ const el=$('#syncChip'); if(!el) return; el.textConten
 function loadSession(){ try{ return JSON.parse(localStorage.getItem(SK)||'null'); }catch(e){ return null; } }
 function saveSession(s){ try{ if(s) localStorage.setItem(SK, JSON.stringify(s)); else localStorage.removeItem(SK); }catch(e){} }
 function authErr(msg){ const e=$('#authErr'); if(e) e.textContent = msg||''; }
+
+let RECOVERY = null;
+function recoverToken(){
+  try{
+    const h = location.hash || '';
+    if(!h || h.indexOf('access_token') < 0) return null;
+    const p = new URLSearchParams(h.slice(1));
+    if(p.get('type') === 'recovery' && p.get('access_token')) return { at: p.get('access_token'), rt: p.get('refresh_token') };
+  }catch(e){}
+  return null;
+}
+
+async function doForgot(){
+  const email = ($('#authEmail').value||'').trim();
+  if(!email){ authErr('先在上面填一下你的邮箱'); return; }
+  authErr('');
+  try{
+    await sbFetch('/auth/v1/recover', { method:'POST', auth:false, token: CFG.key,
+      body: JSON.stringify({ email: email, redirect_to: location.origin + location.pathname }) });
+    toast('重置邮件已发到 ' + email + '，请查收（含垃圾箱）');
+    authErr('已发送。没收到就点一次再发，或联系管理员。');
+  }catch(e){
+    authErr('发送失败：' + String(e.message||e));
+  }
+}
+
+async function doReset(){
+  const pass = ($('#resetPass').value||'');
+  const errEl = $('#resetErr');
+  if(pass.length < 6){ errEl.textContent = '密码至少 6 位'; return; }
+  if(!RECOVERY){ errEl.textContent = '链接已失效，请重新点一次「忘记密码」'; return; }
+  errEl.textContent = '';
+  try{
+    const res = await fetch(CFG.url + '/auth/v1/user', {
+      method:'PUT',
+      headers:{ apikey: CFG.key, Authorization: 'Bearer ' + RECOVERY.at, 'Content-Type':'application/json' },
+      body: JSON.stringify({ password: pass })
+    });
+    if(!res.ok) throw new Error(await res.text());
+    RECOVERY = null;
+    history.replaceState(null, '', location.pathname);
+    $('#resetMask').classList.remove('show');
+    authErr('密码已更新，用新密码登录即可');
+    $('#authMask').classList.add('show');
+    toast('密码已更新');
+  }catch(e){
+    errEl.textContent = '保存失败：' + String(e.message||e);
+  }
+}
 
 async function sbFetch(path, opts){
   opts = opts||{};
@@ -577,6 +638,8 @@ async function afterLogin(){
 }
 
 function bootAuth(){
+  const rec = recoverToken();
+  if(rec){ RECOVERY = rec; $('#resetMask').classList.add('show'); return; }
   if(!hasCloud()){ setSync('本地模式','grey'); return; }
   SESSION = loadSession();
   if(SESSION && SESSION.user){ afterLogin().catch(function(){}); }
@@ -1362,6 +1425,8 @@ function init(){
   $('#authSignup').addEventListener('click', function(){ doLogin(true); });
   $('#authPass').addEventListener('keydown', function(e){ if(e.key === 'Enter') doLogin(false); });
   $('#authEmail').addEventListener('keydown', function(e){ if(e.key === 'Enter') $('#authPass').focus(); });
+  $('#authForgot').addEventListener('click', doForgot);
+  $('#resetSave').addEventListener('click', doReset);
   bootAuth();
   $('#fSearch').addEventListener('input', renderTasks);
   $('#fAcc').addEventListener('change', renderTasks);
